@@ -74,6 +74,7 @@ function bindBotEvents(bot) {
         if (username === MAIN_USERNAME) {
             if (message === '~stasinetic' || message === '~s') {
                 triggerPearl(bot)
+                whisperMessage(bot, MAIN_USERNAME, "Loading pearl...")
                 sendWebhook(`🎯 **Pearlbot triggered pearl action as requested by \`${MAIN_USERNAME}\`.**`)
             }
         }
@@ -108,7 +109,6 @@ async function triggerPearl(bot) {
 
     try {
         console.log('Attempting to trigger pearl...')
-
         // look at block
         await bot.lookAt(pos, true)
         await bot.waitForTicks(2)
@@ -117,11 +117,16 @@ async function triggerPearl(bot) {
         await bot.activateBlock(bot.blockAt(pos))
         await bot.waitForTicks(2)
 
+        // this is stupid, requires direct line of sight, gotta fix this later ^
 
         console.log('Pearl trigger attempt done.')
     } catch (err) {
         console.log('Error while triggering pearl:', err)
     }
+}
+
+async function whisperMessage(bot, recipient, message) {
+    bot.chat(`/w ${recipient} ${message}`)
 }
 
 createBot()
