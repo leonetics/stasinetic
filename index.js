@@ -111,14 +111,13 @@ function bindBotEvents(bot) {
 
     log(`<${username}> ${message}`);
 
-    if (username === MAIN_USERNAME) {
-      if (message === '~stasinetic' || message === '~s') {
-        triggerPearl(bot);
-        whisperMessage(bot, MAIN_USERNAME, 'Loading pearl...');
-        sendWebhook(`🎯 **Pearlbot triggered pearl action as requested by \`${MAIN_USERNAME}\`.**`);
-      }
-    }
-  });
+        if (username === MAIN_USERNAME) {
+            if (message === '~stasinetic' || message === '~s') {
+                triggerPearl(bot)
+                sendWebhook(`🎯 **Pearlbot triggered pearl action as requested by \`${MAIN_USERNAME}\`.**`)
+            }
+        }
+    })
 
   bot.on('kicked', (reason) => {
     log('Kicked: ' + reason);
@@ -218,53 +217,28 @@ async function eatEnchantedGapple(bot) {
 }
 
 async function triggerPearl(bot) {
-  const pos = new Vec3(
-    PEARL_ACTION_BLOCK.x + 0.5,
-    PEARL_ACTION_BLOCK.y + 0.5,
-    PEARL_ACTION_BLOCK.z + 0.5
-  );
+    const pos = new Vec3(
+        PEARL_ACTION_BLOCK.x + 0.5,
+        PEARL_ACTION_BLOCK.y + 0.5,
+        PEARL_ACTION_BLOCK.z + 0.5
+    )
 
-  try {
-    console.log('Attempting to trigger pearl...');
-    await bot.lookAt(pos, true);
-    await bot.waitForTicks(2);
+    try {
+        console.log('Attempting to trigger pearl...')
 
-    await bot.activateBlock(bot.blockAt(pos));
-    await bot.waitForTicks(2);
+        // look at block
+        await bot.lookAt(pos, true)
+        await bot.waitForTicks(2)
 
-    console.log('Pearl trigger attempt done.');
-  } catch (err) {
-    console.log('Error while triggering pearl:', err);
-  }
+        // right click block
+        await bot.activateBlock(bot.blockAt(pos))
+        await bot.waitForTicks(2)
+
+
+        console.log('Pearl trigger attempt done.')
+    } catch (err) {
+        console.log('Error while triggering pearl:', err)
+    }
 }
 
-async function whisperMessage(bot, recipient, message) {
-  bot.chat(`/w ${recipient} ${message}`);
-}
-
-function whitelistCheck(bot) {
-  const intruders = [];
-
-  for (const username in bot.players) {
-    const player = bot.players[username];
-    if (!player || !player.entity) continue;
-    if (username === bot.username) continue;
-    if (WHITELIST.includes(username.toLowerCase())) continue;
-
-    const dist = bot.entity.position.distanceTo(player.entity.position);
-    intruders.push({ username, dist });
-  }
-
-  if (intruders.length === 0) return;
-
-  intruders.sort((a, b) => a.dist - b.dist);
-
-  const summary = intruders
-    .map(p => `${p.username} (${p.dist.toFixed(1)}m)`)
-    .join(', ');
-
-  log(`Non-whitelisted players in render distance: ${summary}`);
-  sendWebhook(`🚨 **Non-whitelisted players in render distance:** ${summary}`);
-}
-
-createBot();
+createBot()
