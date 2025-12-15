@@ -100,9 +100,27 @@ function bindBotEvents(bot) {
 
   bot.on('message', (jsonMsg) => {
     const msg = jsonMsg.toString()
-    if (msg.includes('Connected to the server')) {
-      console.log('Now on main 2b2t server.')
-      sendWebhook('🟢 Now on main 2b2t.')
+
+    // Example formats:
+    // [Player -> me] hello
+    // From Player: hello
+    // fuck you chatgpt
+    let match =
+      msg.match(/^(.+?) whispers: (.+)$/)
+
+    if (!match) return
+
+    const username = match[1]
+    const message = match[2]
+
+    log(`[WHISPER] <${username}> ${message}`)
+
+    // 🔐 example: only allow MAIN_USERNAME
+    if (username === MAIN_USERNAME) {
+      if (message === '~stasinetic' || message === '~s') {
+        triggerPearl(bot)
+        sendWebhook(`🎯 **Pearlbot triggered via whisper by \`${username}\`.**`)
+      }
     }
   })
 
