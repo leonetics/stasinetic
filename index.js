@@ -133,57 +133,58 @@ function bindBotEvents(bot) {
   yumyumFlag = false
   movementFlag = false
 
-  let defaultMove
+  // --- INTRUDER DETECTOR (scoped to this bot instance) ---
+  const INTRUDER_RADIUS = Number(process.env.INTRUDER_RADIUS || 64)
+  const INTRUDER_COOLDOWN_MS = Number(process.env.INTRUDER_COOLDOWN_MS || 30000)
+  let lastIntruderAlertAt = 0
 
-  bot.on('spawn', () => {
-    log('Bot spawned in.')
-    sendWebhook(`✅ **\`${bot.username}\` logged in and spawned.**`)
+  function isWhitelisted(name) {
+    if (!name) return false
+    const n = String(name).toLowerCase()
+    if (n === String(bot.username).toLowerCase()) return true
+    return WHITELIST.includes(n)
+  }
 
-    defaultMove = new Movements(bot)
-    defaultMove.allow1by1towers = false
-    defaultMove.canDig = false
-    defaultMove.scafoldingBlocks.push(bot.registry.itemsByName['netherrack'].id)
-    bot.pathfinder.setMovements(defaultMove)
+  function checkIntruders() {
+    if (!bot.entity) return
 
-    // walk to idle block once on spawn
-    if (IDLE_BLOCK) {
-      moveToIdle(bot)
-    } else {
-      log('IDLE_BLOCK is not defined (check IDLE_POS env var).')
-    }
+    const myPos = bot.entity.position
+    const nearby = Object.values(bot.entities).filter(e =>
+      e &&
+      e.type === 'player' &&
+      e.username &&
+      !isWhitelisted(e.username) &&
+      e.position &&
+      e.position.distanceTo(myPos) <= INTRUDER_RADIUS
+    )
 
-    // Anti-AFK: swing mainhand every 30 seconds
-    setInterval(() => {
-      if (!yumyumFlag) bot.swingArm('right')
-    }, 30000)
-  })
+    if (nearby.length === 0) return
 
+    const now = Date.now()
+    if (now - lastIntruderAlertAt < INTRUDER_COOLDOWN_MS) return
+    lastIntruderAlertAt = now
+
+    intruderFlag = true
+
+    const names = nearby
+      .sort((a, b) => a.position.distanceTo(myPos) - b.position.distanceTo(myPos))
+      .slice(0, 5)
+      .map(e => `${e.username} (${e.position.distanceTo(myPos).toFixed(1)}m)`)
+
+    sendWebhook(`🚨 **INTRUDER NEAR BOT** radius=${INTRUDER_RADIUS}m: ${names.join(', ')}`)
+    // optional: bot.quit('intruder_detected')
+  }
+  
   bot.on('physicsTick', () => {
+    // intruder scan
+    checkIntruders()
+
+    // your existing idle-leash logic
     if (!IDLE_BLOCK || movementFlag || yumyumFlag) return
 
     const idleVec = new Vec3(IDLE_BLOCK.x + 0.5, IDLE_BLOCK.y, IDLE_BLOCK.z + 0.5)
     const dist = bot.entity.position.distanceTo(idleVec)
-
     if (dist > 2) moveToIdle(bot)
-  })
-
-  bot.on('message', (jsonMsg) => {
-    const msg = jsonMsg.toString()
-
-    let match = msg.match(/^(.+?) whispers: (.+)$/)
-    if (!match) return
-
-    const username = match[1]
-    const message = match[2]
-
-    log(`[WHISPER] <${username}> ${message}`)
-
-    if (username === MAIN_USERNAME) {
-      if (message === '~stasinetic' || message === '~s') {
-        triggerPearl(bot)
-        sendWebhook(`🎯 **Pearlbot triggered via whisper by \`${username}\`.**`)
-      }
-    }
   })
 
   bot.on('chat', (username, message) => {
