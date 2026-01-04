@@ -1,0 +1,39 @@
+// rename to state.json
+{
+  "account": {
+    "host": "2b2t.org",
+    "port": 25565,
+    "username": "Stasinetic",
+    "auth": "microsoft",
+    "version": "1.19.2" // important, do not change unless you know what you are doing
+  },
+  "pearls": {
+    "584114153:1767502960318": {
+      "owner": "Leonetic",
+      "pos": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "createdAt": 1767502960318,
+      "lastSeenAt": 1767505010808,
+      "lastMoveAt": 1767502962661,
+      "entityId": 584114153,
+      "dimension": "overworld",
+      "status": "stasis",
+      "lastRawAt": 1767502964189,
+      "lastSpeed": 0.08922408383534136,
+      "stableSince": 1767502963219,
+      "stablePos": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "lastPos": {
+        "x": 0.6792525075,
+        "y": 602.9908849046404,
+        "z": 0.5558007935
+      }
+    }
+  }
+}

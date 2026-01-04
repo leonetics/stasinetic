@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 
 export type AccountConfig = {
   host: string;
@@ -38,7 +39,15 @@ export type PearlRecord = {
   status: PearlStatus;
 };
 
-const STATE_PATH = path.resolve(process.cwd(), "state.json");
+const DEFAULT_STATE_PATH = (() => {
+  // src/ -> dist/ at runtime. dist/state.js -> projectRoot/state.json
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  return path.resolve(here, "..", "state.json");
+})();
+
+const STATE_PATH = process.env.STATE_PATH
+  ? path.resolve(process.env.STATE_PATH)
+  : DEFAULT_STATE_PATH;
 
 export function loadState(): BotState {
   if (!fs.existsSync(STATE_PATH)) {
@@ -50,5 +59,20 @@ export function loadState(): BotState {
 }
 
 export function saveState(state: BotState) {
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2), "utf8");
+  // write to temp then rename.
+  const dir = path.dirname(STATE_PATH);
+  const tmp = path.join(dir, `.state.json.tmp.${process.pid}`);
+
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), "utf8");
+    fs.renameSync(tmp, STATE_PATH);
+  } finally {
+    // best-effort cleanup if something went wrong before rename.
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    } catch {
+      // ignore
+    }
+  }
 }

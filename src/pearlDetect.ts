@@ -1,27 +1,34 @@
-// src/pearlDetect.ts
 import type { Bot } from "mineflayer";
 import type { BotState, Vec3 } from "./state.js";
+import { saveState } from "./state.js";
 import { log } from "./logger.js";
+import { reply, countPearlsFor } from "./commands.js";
 
 /**
- * Goal:
- * - Detect ender pearls
- * - Attribute owner ONLY if a recent swing exists (prevents "guessing" on preexisting pearls)
- * - Promote to stasis ONLY after:
- *    1) pearl is at least MIN_AGE_MS old
- *    2) pearl has been continuously "stable" for SETTLE_MS
- * - Stability is measured via speed + displacement (not just instantaneous jitter)
+ * 1) On startup, detect all pearls currently loaded.
+ *    - If a pearl entityId already exists in JSON, ignore (no duplicates).
+ *    - Otherwise register it as owner="unknown".
+ *
+ * 2) When pearls are triggered / become gone, remove from JSON automatically.
+ *
+ * + When a pearl is promoted to stasis, whisper the owner with updated count.
  */
 
 // ---- promotion / motion tuning ----
 const MIN_AGE_MS = 2500;   // don't promote pearls immediately after spawn
-const SETTLE_MS = 600;    // must remain stable this long
-const SPEED_EPS = 0.08;    // blocks/sec considered "basically not moving"
+const SETTLE_MS = 600;     // must remain stable this long
+const SPEED_EPS = 0.15;    // blocks/sec considered "basically not moving"
 const MOVE_EPS = 0.15;     // ignore tiny jitter displacement (blocks)
 
 // ---- attribution tuning ----
-const SWING_WINDOW_MS = 2000;  // how long a swing is considered relevant
-const CANDIDATE_RADIUS = 14;   // max distance from player to pearl to consider attribution
+const SWING_WINDOW_MS = 300;  // how long a swing is considered relevant
+const CANDIDATE_RADIUS = 14;  // max distance from player to pearl to consider attribution
+
+// ---- reconciliation tuning ----
+const RESCAN_MS = 1000;
+// grace period before deleting a record whose entityId is missing.
+// prevents false deletes when chunks unload/reload or mineflayer misses packets.
+const MISSING_GRACE_MS = 5000;
 
 function clamp01(n: number) {
   return Math.max(0, Math.min(1, n));
@@ -73,21 +80,25 @@ function isEnderPearlEntity(entity: any): boolean {
   return false;
 }
 
-function tryPromoteToStasis(state: BotState, pearlId: string, now: number) {
-  const rec = state.pearls[pearlId];
-  if (!rec) return;
-  if (rec.status !== "airborne") return;
+function nowPos(entity: any): Vec3 {
+  return { x: entity.position.x, y: entity.position.y, z: entity.position.z };
+}
+
+function tryPromoteToStasis(state: BotState, pearlKey: string, now: number): boolean {
+  const rec = state.pearls[pearlKey];
+  if (!rec) return false;
+  if (rec.status !== "airborne") return false;
 
   const age = now - rec.createdAt;
-  if (age < MIN_AGE_MS) return;
+  if (age < MIN_AGE_MS) return false;
 
   const stableSince = (rec as any).stableSince as number | undefined;
-  if (!stableSince) return;
+  if (!stableSince) return false;
 
   const stableFor = now - stableSince;
-  if (stableFor < SETTLE_MS) return;
+  if (stableFor < SETTLE_MS) return false;
 
-  // Promote using last stable raw position to avoid "bad Y mid-flight"
+  // promote using last stable raw position to avoid "bad Y mid-flight"
   const stablePos = (rec as any).stablePos as Vec3 | undefined;
   const raw = stablePos ?? rec.pos;
 
@@ -96,15 +107,51 @@ function tryPromoteToStasis(state: BotState, pearlId: string, now: number) {
   rec.status = "stasis";
 
   log.info(
-    { pearlId, owner: rec.owner, pos: rec.pos, ageMs: age, stableForMs: stableFor },
-    "Pearl promoted to stasis (stable window)"
+    { pearlId: pearlKey, owner: rec.owner, pos: rec.pos, ageMs: age, stableForMs: stableFor },
+    "Pearl promoted to stasis"
   );
+  return true;
 }
 
 export function installPearlDetection(bot: Bot, state: BotState) {
-  // ---- swing capture ----
-  const lastSwingByEntityId = new Map<number, { at: number }>();
+  let saveTimer: ReturnType<typeof setTimeout> | null = null;
+  const scheduleSave = (reason: string) => {
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      try {
+        saveState(state);
+        log.debug({ reason }, "state.json saved");
+      } catch (err: any) {
+        log.error({ err, reason }, "Failed to save state.json");
+      }
+    }, 150);
+  };
 
+  const entityToKey = new Map<number, string>();
+
+  const rebuildIndex = () => {
+    entityToKey.clear();
+    for (const [key, rec] of Object.entries(state.pearls)) {
+      if (typeof rec.entityId === "number") entityToKey.set(rec.entityId, key);
+    }
+  };
+  rebuildIndex();
+
+  // Whisper owner on promotion (always whisper, never public)
+  function notifyPromoted(owner: string) {
+    if (!owner || owner === "unknown") return;
+
+    const n = countPearlsFor(state, owner);
+    reply(
+      bot,
+      owner,
+      true,
+      `Your pearl was promoted to Stasis. You now have ${n} pearl${n === 1 ? "" : "s"} registered.`
+    );
+  }
+
+  const lastSwingByEntityId = new Map<number, { at: number }>();
   const client = (bot as any)._client;
   if (client?.on) {
     client.on("packet", (data: any, meta: any) => {
@@ -132,25 +179,21 @@ export function installPearlDetection(bot: Bot, state: BotState) {
       const dy = ent.position.y - pearlPos.y;
       const dz = ent.position.z - pearlPos.z;
       const distSq = dx * dx + dy * dy + dz * dz;
-
       if (distSq > CANDIDATE_RADIUS * CANDIDATE_RADIUS) continue;
 
-      // REQUIRE a recent swing to attribute (prevents guessing for preexisting pearls)
+      // require a recent swing to attribute (prevents guessing for preexisting pearls)
       const swing = lastSwingByEntityId.get(ent.id);
       if (!swing) continue;
 
       const age = now - swing.at;
       if (age > SWING_WINDOW_MS) continue;
-
       const swingRecency = clamp01(1 - age / SWING_WINDOW_MS);
 
-      // tie-breakers
       const dir = lookDir(ent.yaw ?? 0, ent.pitch ?? 0);
       const toPearl = norm(vecTo(ent.position, pearlPos));
       const facing = clamp01((dot(norm(dir), toPearl) + 1) / 2);
 
       const closeness = 1 / (1 + distSq);
-
       const score = (swingRecency * 4) + (facing * 1.5) + (closeness * 1);
 
       if (score > bestScore) {
@@ -162,67 +205,120 @@ export function installPearlDetection(bot: Bot, state: BotState) {
     return bestUser ?? "unknown";
   }
 
-  bot.on("entitySpawn", (entity) => {
+  function upsertPearlFromEntity(entity: any, source: "startup" | "spawn" | "rescan") {
     if (!isEnderPearlEntity(entity)) return;
 
+    const eId = entity.id as number;
     const now = Date.now();
-    const p = entity.position as Vec3;
 
-    const pearlId = `${entity.id}:${now}`;
-    const owner = pickOwnerForPearl({ x: p.x, y: p.y, z: p.z }, now);
+    // if already tracked by entityId, just refresh lastSeen/pos.
+    const existingKey = entityToKey.get(eId);
+    if (existingKey) {
+      const rec = state.pearls[existingKey];
+      if (!rec) {
+        entityToKey.delete(eId);
+      } else {
+        rec.lastSeenAt = now;
+        const raw = nowPos(entity);
+        if (rec.status === "stasis") rec.lastPos = raw;
+        else rec.pos = raw;
 
-    state.pearls[pearlId] = {
+        delete (rec as any).missingSince;
+      }
+      return;
+    }
+
+    const p = nowPos(entity);
+
+    // attribution ONLY for actual spawn events; for startup/rescan it's unknown.
+    const owner = source === "spawn" ? pickOwnerForPearl(p, now) : "unknown";
+    const pearlKey = source === "spawn" ? `${eId}:${now}` : `pre:${eId}:${now}`;
+
+    state.pearls[pearlKey] = {
       owner,
       pos: { x: p.x, y: p.y, z: p.z },
       createdAt: now,
       lastSeenAt: now,
       lastMoveAt: now,
-      entityId: entity.id,
+      entityId: eId,
       dimension: bot.game?.dimension,
-      status: "airborne"
+      status: "airborne",
     };
 
-    // additional runtime-only fields used by heuristic
-    (state.pearls[pearlId] as any).lastRawAt = now;
-    (state.pearls[pearlId] as any).lastSpeed = undefined;
-    (state.pearls[pearlId] as any).stableSince = undefined;
-    (state.pearls[pearlId] as any).stablePos = undefined;
+    (state.pearls[pearlKey] as any).lastRawAt = now;
+    (state.pearls[pearlKey] as any).lastSpeed = undefined;
+    (state.pearls[pearlKey] as any).stableSince = undefined;
+    (state.pearls[pearlKey] as any).stablePos = undefined;
+    (state.pearls[pearlKey] as any).missingSince = undefined;
 
-    log.info({ pearlId, owner, pos: state.pearls[pearlId].pos }, "Pearl detected (spawn)");
+    entityToKey.set(eId, pearlKey);
 
-    // Delayed re-attribution (only helps if a swing arrives slightly after spawn)
-    if (owner === "unknown") {
+    log.info({ pearlId: pearlKey, entityId: eId, owner, pos: p, source }, "Pearl registered");
+    scheduleSave(`pearl_registered_${source}`);
+
+    // delayed re-attribution for spawned pearls if swing arrives slightly late
+    if (source === "spawn" && owner === "unknown") {
       setTimeout(() => {
-        const rec = state.pearls[pearlId];
+        const rec = state.pearls[pearlKey];
         if (!rec || rec.owner !== "unknown") return;
-
         const better = pickOwnerForPearl(rec.pos, Date.now());
         if (better !== "unknown") {
           rec.owner = better;
-          log.info({ pearlId, owner: better }, "Pearl owner resolved (delayed)");
+          log.info({ pearlId: pearlKey, owner: better }, "Pearl owner resolved (delayed)");
+          scheduleSave("pearl_owner_resolved");
         }
       }, 250);
     }
+  }
+
+  function removePearlRecord(pearlKey: string, reason: string) {
+    const rec = state.pearls[pearlKey];
+    if (!rec) return;
+
+    const eId = rec.entityId;
+    if (typeof eId === "number") entityToKey.delete(eId);
+
+    delete state.pearls[pearlKey];
+    log.info({ pearlId: pearlKey, reason }, "Pearl removed from state");
+    scheduleSave(`pearl_removed_${reason}`);
+  }
+
+  function scanLoadedPearls(pass: "startup" | "delayed" | "rescan") {
+    const entities: any = (bot as any).entities ?? {};
+    for (const ent of Object.values(entities)) {
+      if (!isEnderPearlEntity(ent)) continue;
+      upsertPearlFromEntity(ent, pass === "rescan" ? "rescan" : "startup");
+    }
+  }
+
+  scanLoadedPearls("startup");
+  setTimeout(() => scanLoadedPearls("delayed"), 1500);
+
+  bot.on("entitySpawn", (entity) => {
+    if (!isEnderPearlEntity(entity)) return;
+    upsertPearlFromEntity(entity, "spawn");
   });
 
   bot.on("entityMoved", (entity) => {
     if (!isEnderPearlEntity(entity)) return;
 
     const now = Date.now();
+    const key = entityToKey.get(entity.id);
+    if (!key) return;
 
-    const recKey = Object.keys(state.pearls).find(
-      (k) => state.pearls[k]?.entityId === entity.id
-    );
-    if (!recKey) return;
-
-    const rec = state.pearls[recKey];
-    const newPos = { x: entity.position.x, y: entity.position.y, z: entity.position.z };
+    const rec = state.pearls[key];
+    if (!rec) {
+      entityToKey.delete(entity.id);
+      return;
+    }
 
     rec.lastSeenAt = now;
 
-    // For stasis pearls, don't overwrite snapped pos; keep lastPos for debug
+    const newPos = nowPos(entity);
+
     if (rec.status === "stasis") {
       rec.lastPos = newPos;
+      delete (rec as any).missingSince;
       return;
     }
 
@@ -239,7 +335,6 @@ export function installPearlDetection(bot: Bot, state: BotState) {
     (rec as any).lastSpeed = speed;
     (rec as any).lastRawAt = now;
 
-    // Determine stability
     const moved = d > MOVE_EPS;
 
     if (moved || speed > SPEED_EPS) {
@@ -251,51 +346,67 @@ export function installPearlDetection(bot: Bot, state: BotState) {
       (rec as any).stablePos = newPos;
     }
 
-    tryPromoteToStasis(state, recKey, now);
+    const promoted = tryPromoteToStasis(state, key, now);
+    if (promoted) {
+      notifyPromoted(rec.owner);
+      scheduleSave("pearl_promoted_to_stasis");
+    }
+
+    delete (rec as any).missingSince;
   });
 
   bot.on("entityGone", (entity) => {
     if (!isEnderPearlEntity(entity)) return;
 
-    const now = Date.now();
+    const key = entityToKey.get(entity.id);
+    if (!key) return;
 
-    const recKey = Object.keys(state.pearls).find(
-      (k) => state.pearls[k]?.entityId === entity.id
-    );
-    if (!recKey) return;
-
-    const rec = state.pearls[recKey];
-
-    if (rec.status === "stasis") {
-      rec.lastSeenAt = now;
-      rec.entityId = undefined;
-      log.info({ pearlId: recKey, owner: rec.owner }, "Stasis pearl entity gone (kept)");
-      return;
-    }
-
-    // last-moment promotion attempt
-    tryPromoteToStasis(state, recKey, now);
-
-    if (state.pearls[recKey].status === "stasis") {
-      state.pearls[recKey].entityId = undefined;
-      log.info({ pearlId: recKey, owner: rec.owner }, "Pearl gone but promoted to stasis");
-      return;
-    }
-
-    rec.status = "gone";
-    rec.lastSeenAt = now;
-    rec.entityId = undefined;
-
-    log.info({ pearlId: recKey, owner: rec.owner }, "Pearl entity gone (not stasis)");
+    removePearlRecord(key, "entityGone");
   });
 
-  // Periodic promotion in case entityMoved stops firing (lag/chunk weirdness)
   setInterval(() => {
     const now = Date.now();
-    for (const [id, rec] of Object.entries(state.pearls)) {
-      if (rec.status === "airborne") {
-        tryPromoteToStasis(state, id, now);
+
+    scanLoadedPearls("rescan");
+
+    const entities: any = (bot as any).entities ?? {};
+
+    for (const [key, rec] of Object.entries(state.pearls)) {
+      const eId = rec.entityId;
+      if (typeof eId !== "number") continue;
+
+      const ent = entities[eId];
+
+      if (ent && isEnderPearlEntity(ent)) {
+        rec.lastSeenAt = now;
+
+        const raw = nowPos(ent);
+        if (rec.status === "stasis") rec.lastPos = raw;
+        else rec.pos = raw;
+
+        delete (rec as any).missingSince;
+        continue;
+      }
+
+      const missingSince = (rec as any).missingSince as number | undefined;
+      if (!missingSince) {
+        (rec as any).missingSince = now;
+        continue;
+      }
+
+      if (now - missingSince >= MISSING_GRACE_MS) {
+        removePearlRecord(key, "missing_rescan");
       }
     }
-  }, 500);
+
+    for (const [key, rec] of Object.entries(state.pearls)) {
+      if (rec.status !== "airborne") continue;
+
+      const promoted = tryPromoteToStasis(state, key, now);
+      if (promoted) {
+        notifyPromoted(rec.owner);
+        scheduleSave("pearl_promoted_interval");
+      }
+    }
+  }, RESCAN_MS);
 }
